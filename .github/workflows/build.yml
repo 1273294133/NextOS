@@ -1,23 +1,22 @@
 # ============================================================================
-#  NextOS — GitHub Actions 构建流水线
+#  NextOS — GitHub Actions 构建流水线（含缓存）
 #
-#  两种模式（在 workflow_dispatch 里选择）：
+#  缓存设计（已实测验证有效性）：
+#   1. 编译镜像缓存 → GHCR (ghcr.io/<owner>/nextos-builder:<Dockerfile哈希>)
+#      构建环境镜像(archlinux+全部构建依赖)只构建/推送一次，后续运行直接
+#      docker pull 复用，避免每轮重装依赖。按 Dockerfile 内容哈希做 tag，
+#      改 Dockerfile 才会重新构建，保证缓存不失效于错误镜像。
+#   2. ccache 编译缓存 → full 模式显式开启 LOCAL_CCACHE_SUPPORT=yes，
+#      缓存目录位于 build.NextOS-*/ 下；在持久化磁盘的自托管 runner 上，
+#      连续构建会自动复用（无需 actions/cache，构建根本身即缓存）。
 #
-#  · smoke（默认，托管 runner 即可）：
-#      构建 Arch-R 编译镜像(archr-build) → 在容器内跑 scripts/checkdeps +
-#      加载项目配置，验证"构建环境是否就绪"。免费 runner 上可跑通。
+#  两种模式（workflow_dispatch 选择）：
+#   · smoke（默认，托管 runner 即可）：恢复镜像 + 容器内 checkdeps + 加载配置，
+#      验证构建环境就绪。
+#   · full（完整交叉编译整包发行版）：真正编译内核+工具链+Mesa/sway/ES/模拟器等，
+#      产出可刷写镜像。**必须在自托管/larger runner 上跑**（磁盘≥80GB，数小时）。
 #
-#  · full（完整交叉编译整包发行版）：
-#      真正编译内核 + 交叉工具链 + Mesa/sway/EmulationStation/模拟器等全部包，
-#      产出可刷写的系统镜像。**必须在自托管/larger runner 上跑**：
-#        - 磁盘 ≥ 80GB（源包下载 + 构建产物 + 镜像）
-#        - 时间数小时起（单任务 timeout 已放宽到 360 分钟）
-#        - 需安装 Docker（Makefile 的 docker-* 目标依赖）
-#      在 workflow_dispatch 的 `runner` 输入里填你的自托管标签即可。
-#
-#  触发方式：
-#    · 手动：Actions → Build NextOS → Run workflow（推荐，可选手动选设备/模式）
-#    · 自动：push/PR 到 main 且改动构建相关路径时，默认跑 smoke
+#  触发：手动 workflow_dispatch；push/PR 到 main 且改动构建相关路径时自动跑 smoke。
 # ============================================================================
 
 name: Build NextOS
@@ -60,6 +59,10 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+  packages: write   # 推送/拉取 GHCR 编译镜像缓存
+
 # 同一分支同时只跑一个构建，避免资源抢占
 concurrency:
   group: build-${{ github.ref }}
@@ -88,15 +91,29 @@ jobs:
           echo "DEVICE=$DEVICE  MODE=$MODE"
 
       # ------------------------------------------------------------------
-      # 构建 Arch-R 编译镜像（archr-build）。full 和 smoke 都需要它。
-      # Makefile 会按宿主架构 buildx build --load，产物 tag=archr-build:latest
+      # 编译镜像缓存：命中 GHCR 直接复用，否则构建并推送。
+      # tag 用 Dockerfile 内容哈希，改 Dockerfile 自动失效重建，保证正确性。
       # ------------------------------------------------------------------
-      - name: 构建 Arch-R 编译镜像 (archr-build)
-        run: make docker-image-build
+      - name: 恢复或构建编译镜像（GHCR 缓存）
+        run: |
+          set -e
+          HASH=$(sha256sum Dockerfile | cut -c1-12)
+          IMG="ghcr.io/${{ github.repository_owner }}/nextos-builder:${HASH}"
+          echo "cache image: $IMG"
+          if docker pull "$IMG" 2>/dev/null; then
+            docker tag "$IMG" archr-build:latest
+            echo "命中 GHCR 缓存，跳过镜像重建"
+          else
+            echo "无缓存，构建编译镜像..."
+            make docker-image-build
+            docker tag archr-build:latest "$IMG"
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker push "$IMG"
+            echo "镜像已推送至 GHCR"
+          fi
 
       # ------------------------------------------------------------------
-      # smoke：在容器内验证构建环境就绪 + 项目配置可加载
-      # 容器内已装好 checkdeps 要求的全部宿主工具，应全部通过。
+      # smoke：容器内验证构建环境就绪 + 项目配置可加载。
       # ------------------------------------------------------------------
       - name: Smoke 检查（容器内 checkdeps + 项目配置加载）
         if: ${{ env.MODE == 'smoke' }}
@@ -116,14 +133,16 @@ jobs:
 
       # ------------------------------------------------------------------
       # full：完整交叉编译整包发行版（含 arm + aarch64 两套）。
-      # 产物输出到 target/ 与 release/，随后上传为 artifact。
-      # 仅在自托管/larger runner 上执行（托管 runner 磁盘/内存不够）。
+      # 显式开启 ccache(LOCAL_CCACHE_SUPPORT=yes)；在持久化自托管 runner 上，
+      # build.NextOS-*/ 与 ccache 目录跨轮保留 → 连续构建自动增量复用。
+      # 产物输出 target/ 与 release/，随后上传为 artifact。
       # ------------------------------------------------------------------
       - name: 完整编译发行版（full）
         if: ${{ env.MODE == 'full' }}
-        run: make docker-${{ inputs.device || 'Amlogic-nxtos' }}
         env:
+          LOCAL_CCACHE_SUPPORT: 'yes'
           OFFICIAL: 'no'
+        run: make docker-${{ inputs.device || 'Amlogic-nxtos' }}
 
       - name: 上传构建产物（full）
         if: ${{ env.MODE == 'full' }}
