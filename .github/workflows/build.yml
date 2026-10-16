@@ -1,0 +1,136 @@
+# ============================================================================
+#  NextOS — GitHub Actions 构建流水线
+#
+#  两种模式（在 workflow_dispatch 里选择）：
+#
+#  · smoke（默认，托管 runner 即可）：
+#      构建 Arch-R 编译镜像(archr-build) → 在容器内跑 scripts/checkdeps +
+#      加载项目配置，验证"构建环境是否就绪"。免费 runner 上可跑通。
+#
+#  · full（完整交叉编译整包发行版）：
+#      真正编译内核 + 交叉工具链 + Mesa/sway/EmulationStation/模拟器等全部包，
+#      产出可刷写的系统镜像。**必须在自托管/larger runner 上跑**：
+#        - 磁盘 ≥ 80GB（源包下载 + 构建产物 + 镜像）
+#        - 时间数小时起（单任务 timeout 已放宽到 360 分钟）
+#        - 需安装 Docker（Makefile 的 docker-* 目标依赖）
+#      在 workflow_dispatch 的 `runner` 输入里填你的自托管标签即可。
+#
+#  触发方式：
+#    · 手动：Actions → Build NextOS → Run workflow（推荐，可选手动选设备/模式）
+#    · 自动：push/PR 到 main 且改动构建相关路径时，默认跑 smoke
+# ============================================================================
+
+name: Build NextOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: '目标设备（决定内核/GPU 栈）'
+        required: true
+        default: 'Amlogic-nxtos'
+        type: choice
+        options:
+          - Amlogic-nxtos   # S905W L/D/M，mainline 7.x + Lima（主推，开源全栈）
+          - Amlogic-no      # S905X5/X5M/S928X，BSP 5.15 + libMali 闭源 blob
+          - RK3326
+      mode:
+        description: 'smoke=环境检查(托管runner可跑)；full=完整编译(需自托管大runner)'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - full
+      runner:
+        description: 'runner 标签。smoke 用 ubuntu-latest；full 填自托管标签(如 nextos-builder)'
+        required: false
+        default: 'ubuntu-latest'
+
+  push:
+    branches: [ main ]
+    paths:
+      - 'packages/**'
+      - 'projects/**'
+      - 'config/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ main ]
+
+# 同一分支同时只跑一个构建，避免资源抢占
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: NextOS ${{ inputs.device || 'Amlogic-nxtos' }} [${{ inputs.mode || 'smoke' }}]
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    env:
+      DEVICE: ${{ inputs.device || 'Amlogic-nxtos' }}
+      MODE: ${{ inputs.mode || 'smoke' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          echo "== OS / 内核 =="; uname -a
+          echo "== CPU =="; nproc
+          echo "== 内存 =="; free -h | head -2
+          echo "== 磁盘 =="; df -h / | tail -1
+          echo "== Docker =="; docker version 2>/dev/null | head -3 || echo "no docker (full 模式需要)"
+          echo "== Git =="; git --version
+          echo "DEVICE=$DEVICE  MODE=$MODE"
+
+      # ------------------------------------------------------------------
+      # 构建 Arch-R 编译镜像（archr-build）。full 和 smoke 都需要它。
+      # Makefile 会按宿主架构 buildx build --load，产物 tag=archr-build:latest
+      # ------------------------------------------------------------------
+      - name: 构建 Arch-R 编译镜像 (archr-build)
+        run: make docker-image-build
+
+      # ------------------------------------------------------------------
+      # smoke：在容器内验证构建环境就绪 + 项目配置可加载
+      # 容器内已装好 checkdeps 要求的全部宿主工具，应全部通过。
+      # ------------------------------------------------------------------
+      - name: Smoke 检查（容器内 checkdeps + 项目配置加载）
+        if: ${{ env.MODE == 'smoke' }}
+        run: |
+          ./scripts/get_env > .env
+          docker run --rm --env-file .env \
+            --user "$(id -u):$(id -g)" \
+            -v "$(pwd)":/work -w /work \
+            archr-build:latest \
+            bash -lc '
+              echo "--- checkdeps ---";
+              bash scripts/checkdeps || { echo "::error::checkdeps 未通过"; exit 1; };
+              echo "--- 加载项目配置 ---";
+              . config/options;
+              echo "OK: PROJECT=$PROJECT  DEVICE=$DEVICE  DISTRO=$DISTRO  WM=$WINDOWMANAGER";
+            '
+
+      # ------------------------------------------------------------------
+      # full：完整交叉编译整包发行版（含 arm + aarch64 两套）。
+      # 产物输出到 target/ 与 release/，随后上传为 artifact。
+      # 仅在自托管/larger runner 上执行（托管 runner 磁盘/内存不够）。
+      # ------------------------------------------------------------------
+      - name: 完整编译发行版（full）
+        if: ${{ env.MODE == 'full' }}
+        run: make docker-${{ inputs.device || 'Amlogic-nxtos' }}
+        env:
+          OFFICIAL: 'no'
+
+      - name: 上传构建产物（full）
+        if: ${{ env.MODE == 'full' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: NextOS-${{ inputs.device || 'Amlogic-nxtos' }}
+          path: |
+            target/NextOS-${{ inputs.device || 'Amlogic-nxtos' }}-*
+            release/NextOS-${{ inputs.device || 'Amlogic-nxtos' }}-*
+          if-no-files-found: error
